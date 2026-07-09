@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:15
+    container_name: vault-db
+    environment:
+      POSTGRES_USER: vault
+      POSTGRES_PASSWORD: vault
+      POSTGRES_DB: vault
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vault -d vault"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - vault-db-data:/var/lib/postgresql/data
+
+volumes:
+  vault-db-data:
