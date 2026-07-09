@@ -10,9 +10,9 @@ export interface IntegrationEvent {
 export type EventHandler = (event: IntegrationEvent) => void | Promise<void>;
 
 /**
- * In-memory broker stub for Phase 2. Swapped for RabbitMQ in Phase 3+. Delivery
- * is at-least-once (the relay may re-publish after a crash), so handlers must be
- * idempotent — they should dedupe on `event.id`.
+ * In-memory broker stub. Swapped for RabbitMQ in a later phase. Delivery is
+ * at-least-once (the relay may re-publish after a crash), so handlers must be
+ * idempotent — dedupe on `event.id`.
  */
 @Injectable()
 export class EventBus {

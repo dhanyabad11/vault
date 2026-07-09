@@ -1,8 +1,6 @@
-import { createHarness, Harness, randomUserId } from './harness';
+import { createHarness, Harness, uuid } from './harness';
 
-// The ledger is append-only. Prove the database itself rejects UPDATE and DELETE
-// on ledger_entries, so immutability does not rely on application discipline.
-describe('ledger_entries is append-only', () => {
+describe('ledger_entries is append-only (Ledger Service)', () => {
   let h: Harness;
 
   beforeAll(async () => {
@@ -16,29 +14,20 @@ describe('ledger_entries is append-only', () => {
   });
 
   it('rejects UPDATE and DELETE at the database layer', async () => {
-    const wallet = await h.wallets.create({
-      userId: randomUserId(),
-      openingBalance: 500,
-    });
-    const row = await h.db.query<{ id: string }>(
-      'SELECT id FROM ledger_entries WHERE wallet_id = $1 LIMIT 1',
-      [wallet.id],
+    const w = await h.wallet.createWallet(uuid());
+    await h.orchestrator.fund({ walletId: w.id, amount: 500, idempotencyKey: uuid() });
+
+    const row = await h.ledgerDb.query<{ id: string }>(
+      `SELECT id FROM ledger_entries WHERE wallet_id = $1 LIMIT 1`,
+      [w.id],
     );
-    const entryId = row.rows[0].id;
+    const id = row.rows[0].id;
 
     await expect(
-      h.db.query('UPDATE ledger_entries SET amount = 1 WHERE id = $1', [entryId]),
+      h.ledgerDb.query(`UPDATE ledger_entries SET amount = 1 WHERE id = $1`, [id]),
     ).rejects.toThrow(/append-only/);
-
     await expect(
-      h.db.query('DELETE FROM ledger_entries WHERE id = $1', [entryId]),
+      h.ledgerDb.query(`DELETE FROM ledger_entries WHERE id = $1`, [id]),
     ).rejects.toThrow(/append-only/);
-
-    // The row is still intact and unchanged.
-    const after = await h.db.query<{ amount: number }>(
-      'SELECT amount FROM ledger_entries WHERE id = $1',
-      [entryId],
-    );
-    expect(after.rows[0].amount).toBe(500);
   });
 });

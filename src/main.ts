@@ -2,20 +2,26 @@ import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { migrate } from './database/migrate';
-import { OutboxRelay } from './outbox/outbox.relay';
+import { OutboxRelay } from './services/orchestrator/outbox.relay';
+import { OrchestratorService } from './services/orchestrator/orchestrator.service';
 import { config } from './config';
 
 async function bootstrap(): Promise<void> {
-  // Dev convenience: ensure the schema exists before serving traffic.
   await migrate();
   const app = await NestFactory.create(AppModule);
 
-  // Start the background outbox relay (publishes committed events to the broker).
+  // On startup, drive any saga that was interrupted mid-flight back to a
+  // terminal state (crash recovery), then start the outbox relay.
+  const resumed = await app.get(OrchestratorService).resumePending();
+  if (resumed > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`recovered ${resumed} in-flight transaction(s)`);
+  }
   app.get(OutboxRelay).start();
 
   await app.listen(config.port);
   // eslint-disable-next-line no-console
-  console.log(`wallet service listening on :${config.port}`);
+  console.log(`services listening on :${config.port}`);
 }
 
 bootstrap();

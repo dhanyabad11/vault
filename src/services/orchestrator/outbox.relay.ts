@@ -1,13 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { DatabaseService } from '../database/database.service';
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { ORCHESTRATOR_DB, SchemaDatabase } from '../../database/schema-database';
 import { OutboxRepository } from './outbox.repository';
-import { EventBus } from './event-bus';
+import { EventBus } from '../../messaging/event-bus';
 
 /**
- * Publishes committed outbox rows to the broker. A single transaction claims a
- * batch (FOR UPDATE SKIP LOCKED), publishes each, then marks it published. If
- * publish or mark throws, the whole batch rolls back and stays unpublished —
- * i.e. at-least-once delivery. Per-event retry + dead-lettering arrives in Phase 4.
+ * Publishes committed orchestrator outbox rows to the broker. One transaction
+ * claims a batch (FOR UPDATE SKIP LOCKED), publishes each, then marks it. If any
+ * step throws, the batch rolls back and stays unpublished — at-least-once
+ * delivery. Per-event retry + dead-lettering arrives in Phase 4.
  */
 @Injectable()
 export class OutboxRelay {
@@ -15,12 +15,11 @@ export class OutboxRelay {
   private timer?: NodeJS.Timeout;
 
   constructor(
-    private readonly db: DatabaseService,
+    @Inject(ORCHESTRATOR_DB) private readonly db: SchemaDatabase,
     private readonly outbox: OutboxRepository,
     private readonly bus: EventBus,
   ) {}
 
-  /** Process a single batch. Returns the number of events published. */
   async processBatch(batchSize = 100): Promise<number> {
     return this.db.withTransaction(async (client) => {
       const rows = await this.outbox.lockUnpublishedBatch(client, batchSize);
@@ -37,7 +36,6 @@ export class OutboxRelay {
     });
   }
 
-  /** Background poller for the running app. Tests call processBatch() directly. */
   start(intervalMs = 500): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
@@ -45,7 +43,6 @@ export class OutboxRelay {
         this.logger.error(`relay batch failed: ${(err as Error).message}`),
       );
     }, intervalMs);
-    // Do not keep the event loop alive solely for the poller.
     this.timer.unref?.();
   }
 

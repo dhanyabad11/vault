@@ -2,7 +2,33 @@
 
 A portfolio project demonstrating distributed transaction handling. Built incrementally.
 
-## Phase 2 — idempotency keys + transactional outbox (current)
+## Phase 3 — split services + orchestrator + TCC (current)
+
+The monolith is now three services, each with its **own Postgres schema and connection
+pool** (`wallet`, `ledger`, `orchestrator`) — no cross-schema SQL and no transaction can
+span services, which is exactly why TCC is required instead of one ACID transaction.
+
+- **Wallet Service** (`wallet` schema) — owns `wallets` + a `holds` table. Available balance
+  = `balance − SUM(HELD debit holds)`. Try/Confirm/Cancel operate on holds.
+- **Ledger Service** (`ledger` schema) — the immutable journal; idempotent append
+  (`ON CONFLICT DO NOTHING` on `(transaction_id, wallet_id, type)`).
+- **Transaction Orchestrator** (`orchestrator` schema) — drives the TCC saga, tracks status
+  (`STARTED→RESERVING→RESERVED→CONFIRMING→CONFIRMED` / `CANCELLING→CANCELLED`), logs every
+  transition to `transaction_steps`, and emits saga-completion events via its outbox.
+
+**TCC flow** for A→B: reserve a DEBIT hold on A (checks available funds, serialized by an
+optimistic version bump) and a CREDIT hold on B → confirm both (settle into balances) → append
+the ledger pair. A failed Try triggers Cancel of all legs. **Every downstream step is
+idempotent** (hold status transitions guard confirm/cancel; ledger append dedupes), so
+`resumePending()` recovery just re-drives an interrupted saga to a terminal state — money
+neither lost nor duplicated. Services talk through in-process client interfaces that simulate
+synchronous RPC (swappable to HTTP/RabbitMQ later).
+
+Tests: `tcc-happy`, `tcc-cancel`, `reserve-concurrency` (50 concurrent transfers, exactly 10
+settle), `tcc-recovery` (crash mid-CONFIRMING and mid-RESERVING → resume completes exactly
+once), plus re-pointed `idempotency`, `immutability`, `invariant`, `outbox`.
+
+## Phase 2 — idempotency keys + transactional outbox
 
 Makes writes safe to retry, on the same single service.
 
@@ -39,50 +65,44 @@ distribution is introduced.
   - *Pessimistic*: `SELECT ... FOR UPDATE` in deterministic id order, then mutate — no retry
     needed. Included so the benchmark can compare contention behavior.
 
-### Run it
+## Run it
 
 ```bash
 npm install
-docker compose up -d db      # Postgres 15 on :5432
-npm run migrate              # apply schema (idempotent)
-npm test                     # runs the concurrency / invariant / immutability / benchmark suites
-npm start                    # optional: HTTP API on :3000
+docker compose up -d db      # Postgres 15 on :5432 (or use a local Postgres — see below)
+npm run migrate              # apply all schema migrations (idempotent)
+npm test                     # runs the full suite against a real Postgres
+npm start                    # HTTP API on :3000
 ```
 
 `DATABASE_URL` defaults to `postgres://vault:vault@localhost:5432/vault` (see `.env.example`).
+If you use a local Postgres instead of Docker, point it there, e.g.
+`export DATABASE_URL=postgres://<user>@localhost:5432/vault`.
 
-### Tests (the actual point)
+HTTP endpoints: `POST /wallets`, `GET /wallets/:id`, `POST /wallets/:id/fund`,
+`POST /transfers`, `GET /transactions/:id`. Write endpoints require an `Idempotency-Key` header.
 
-- `concurrency.spec.ts` — 50 simultaneous transfers from a wallet funded for 10; asserts
-  exactly 10 succeed, 40 fail with `InsufficientFundsError`, balance ends at 0, never negative,
-  and cache == ledger. Runs under **both** locking strategies.
-- `lost-update.spec.ts` — 50 concurrent credits; version bumped exactly 50 times, no lost writes.
-- `immutability.spec.ts` — `UPDATE`/`DELETE` on the journal are rejected by the DB.
-- `invariant.spec.ts` — cache reconciles to the ledger after mixed transfers.
-- `benchmark.spec.ts` — prints optimistic vs pessimistic timings under hot-wallet contention.
+## Known limitations (deliberate shortcuts)
 
-## Known limitations (deliberate Phase 1 shortcuts)
+Intentional and addressed in later phases — worth naming in an interview:
 
-These are intentional and addressed in later phases — worth naming in an interview:
-
-1. **In-memory event bus, not RabbitMQ.** Outbox rows survive a crash, but the bus itself is
-   process-local. → Phase 3+ swaps in RabbitMQ.
-2. **Relay rolls back the whole batch on a publish error** (at-least-once, but no per-event
-   isolation). → Phase 4 adds per-event retry + dead-letter queue.
-3. **Single database and schema.** No real service isolation. → Phase 3 splits Wallet / Ledger /
-   Orchestrator with the TCC flow.
-4. **Single-sided funding.** Deposits and opening balances create money from "equity" with no
-   counterparty debit, so cross-wallet conservation is not globally enforced. → Phase 5
-   reconciliation job adds the global check.
-5. **`BIGINT` parsed to JS `number`.** Safe below 2^53 minor units; a real system would use
+1. **In-process service clients, not real network RPC.** Schema + pool isolation forbids a
+   shared transaction, but there's no true process boundary yet, so network partitions can't be
+   simulated. → deployment step / RabbitMQ transport.
+2. **Confirm retries are naive**; a persistently failing Confirm just leaves the saga
+   recoverable — no timeout auto-cancel, DLQ, or alerting. → Phase 4.
+3. **Recovery is manual/on-boot** (`resumePending()`); a stuck reservation locks funds until it
+   runs. → Phase 4 adds timeout-driven auto-cancel; Phase 5 the scheduled reconciliation + chaos test.
+4. **In-memory event bus, not RabbitMQ.** Outbox rows survive a crash; the bus is process-local.
+5. **Single-sided funding.** `fund` credits with no counterparty debit, so cross-wallet
+   conservation isn't globally enforced. → Phase 5 reconciliation job.
+6. **`BIGINT` parsed to JS `number`.** Safe below 2^53 minor units; production would use
    `BigInt`/decimal.
-6. **Backoff/retry is naive** and `MAX_ATTEMPTS` is generous to keep the hot-wallet test
-   deterministic. Production would tune these and add metrics.
 
 ## Build order
 
 - Phase 1 — wallet + ledger correctness under concurrency ✅
-- Phase 2 — idempotency keys + outbox pattern ✅ (this)
-- Phase 3 — split services + Transaction Orchestrator + TCC (Try/Confirm/Cancel)
+- Phase 2 — idempotency keys + outbox pattern ✅
+- Phase 3 — split services + Transaction Orchestrator + TCC (Try/Confirm/Cancel) ✅ (this)
 - Phase 4 — timeouts, auto-cancel, exponential backoff, dead-letter queue
 - Phase 5 — reconciliation job + chaos test (kill orchestrator mid-transaction)
