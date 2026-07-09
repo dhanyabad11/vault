@@ -24,6 +24,14 @@ export class WalletNotFoundError extends Error {
   }
 }
 
+/** Same idempotency key replayed with a different request body. Client bug. */
+export class IdempotencyConflictError extends Error {
+  constructor(key: string) {
+    super(`idempotency key ${key} was reused with different request parameters`);
+    this.name = 'IdempotencyConflictError';
+  }
+}
+
 /** Postgres deadlock / serialization failures worth retrying. */
 export function isRetryablePgError(err: unknown): boolean {
   const code = (err as { code?: string })?.code;

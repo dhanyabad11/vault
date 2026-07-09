@@ -1,11 +1,18 @@
 import { Injectable } from '@nestjs/common';
+import { PoolClient } from 'pg';
 import { randomUUID } from 'crypto';
 import { DatabaseService } from '../database/database.service';
 import { WalletsRepository } from '../wallets/wallets.repository';
 import { LedgerRepository } from '../ledger/ledger.repository';
 import { TransactionsRepository } from './transactions.repository';
+import {
+  IdempotencyRepository,
+  hashRequest,
+} from '../idempotency/idempotency.repository';
+import { OutboxRepository } from '../outbox/outbox.repository';
 import { assertValidAmount } from '../common/money';
 import {
+  IdempotencyConflictError,
   InsufficientFundsError,
   OptimisticConflictError,
   WalletNotFoundError,
@@ -19,11 +26,22 @@ export interface TransferInput {
   toWallet: string;
   amount: number;
   strategy?: LockStrategy;
+  /** Client-supplied idempotency key. Omitted at the service layer -> generated
+   * (each call unique, i.e. no dedup). The HTTP layer requires it. */
+  idempotencyKey?: string;
+}
+
+export interface DepositInput {
+  walletId: string;
+  amount: number;
+  idempotencyKey?: string;
 }
 
 export interface TransferResult {
   transactionId: string;
   attempts: number;
+  /** true when this was a replay of a previously-committed idempotent request. */
+  replayed: boolean;
 }
 
 const MAX_ATTEMPTS = 100;
@@ -35,6 +53,8 @@ export class TransactionsService {
     private readonly wallets: WalletsRepository,
     private readonly ledger: LedgerRepository,
     private readonly transactions: TransactionsRepository,
+    private readonly idempotency: IdempotencyRepository,
+    private readonly outbox: OutboxRepository,
   ) {}
 
   async transfer(input: TransferInput): Promise<TransferResult> {
@@ -42,22 +62,35 @@ export class TransactionsService {
     if (input.fromWallet === input.toWallet) {
       throw new Error('cannot transfer to the same wallet');
     }
+    const key = input.idempotencyKey ?? randomUUID();
+    const requestHash = hashRequest({
+      op: 'transfer',
+      fromWallet: input.fromWallet,
+      toWallet: input.toWallet,
+      amount: input.amount,
+    });
     const strategy = input.strategy ?? 'optimistic';
     return strategy === 'optimistic'
-      ? this.transferOptimistic(input)
-      : this.transferPessimistic(input);
+      ? this.transferOptimistic(input, key, requestHash)
+      : this.transferPessimistic(input, key, requestHash);
   }
 
   /**
    * Optimistic strategy: no locks held across the read. Each wallet mutation is a
-   * conditional UPDATE guarded by the version we read. If a concurrent writer got
-   * there first the guard matches 0 rows; we re-read to tell apart "insufficient
-   * funds" (terminal) from "someone else moved" (retry the whole transaction).
+   * conditional UPDATE guarded by the version we read. A 0-row result is
+   * classified by re-reading: insufficient funds (terminal) vs. lost race (retry).
    */
-  private async transferOptimistic(input: TransferInput): Promise<TransferResult> {
+  private async transferOptimistic(
+    input: TransferInput,
+    key: string,
+    requestHash: string,
+  ): Promise<TransferResult> {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        const transactionId = await this.db.withTransaction(async (client) => {
+        const outcome = await this.db.withTransaction(async (client) => {
+          const replay = await this.checkIdempotency(client, key, requestHash);
+          if (replay) return replay;
+
           const from = await this.wallets.findById(client, input.fromWallet);
           const to = await this.wallets.findById(client, input.toWallet);
           if (!from) throw new WalletNotFoundError(input.fromWallet);
@@ -66,9 +99,8 @@ export class TransactionsService {
             throw new InsufficientFundsError(from.id);
           }
 
-          // Apply mutations in a deterministic order (by id) so two opposing
-          // transfers (A->B and B->A) acquire row locks in the same order and
-          // cannot deadlock.
+          // Apply mutations in deterministic id order so opposing transfers
+          // (A->B and B->A) acquire row locks in the same order -> no deadlock.
           const ops = [
             { id: from.id, delta: -input.amount, version: from.version },
             { id: to.id, delta: input.amount, version: to.version },
@@ -82,7 +114,6 @@ export class TransactionsService {
               op.version,
             );
             if (!applied) {
-              // Classify the failure: exhausted funds vs. stale version.
               const fresh = await this.wallets.findById(client, op.id);
               if (op.delta < 0 && fresh && fresh.balance < -op.delta) {
                 throw new InsufficientFundsError(op.id);
@@ -91,16 +122,15 @@ export class TransactionsService {
             }
           }
 
-          const journal = {
-            id: randomUUID(),
+          const transactionId = await this.writeTransfer(client, {
             from: from.id,
             to: to.id,
             amount: input.amount,
-          };
-          await this.writeJournal(client, journal);
-          return journal.id;
+          });
+          await this.idempotency.recordResult(client, key, transactionId);
+          return { transactionId, replayed: false as const };
         });
-        return { transactionId, attempts: attempt };
+        return { ...outcome, attempts: attempt };
       } catch (err) {
         const retryable =
           err instanceof OptimisticConflictError || isRetryablePgError(err);
@@ -111,17 +141,22 @@ export class TransactionsService {
         throw err;
       }
     }
-    // Unreachable: the loop either returns or throws on the final attempt.
     throw new OptimisticConflictError(input.fromWallet);
   }
 
   /**
-   * Pessimistic strategy: lock both rows FOR UPDATE (in deterministic id order to
-   * avoid deadlock), then mutate. The locks serialize concurrent writers, so no
-   * retry loop is needed.
+   * Pessimistic strategy: lock both rows FOR UPDATE (deterministic id order),
+   * then mutate. Locks serialize concurrent writers, so no retry loop is needed.
    */
-  private async transferPessimistic(input: TransferInput): Promise<TransferResult> {
-    const transactionId = await this.db.withTransaction(async (client) => {
+  private async transferPessimistic(
+    input: TransferInput,
+    key: string,
+    requestHash: string,
+  ): Promise<TransferResult> {
+    const outcome = await this.db.withTransaction(async (client) => {
+      const replay = await this.checkIdempotency(client, key, requestHash);
+      if (replay) return replay;
+
       const ids = [input.fromWallet, input.toWallet].sort();
       for (const id of ids) {
         const locked = await this.wallets.lockForUpdate(client, id);
@@ -129,33 +164,39 @@ export class TransactionsService {
       }
 
       const debited = await this.wallets.applyDelta(client, input.fromWallet, -input.amount);
-      if (!debited) {
-        // Row is locked, so a false here means the balance guard failed.
-        throw new InsufficientFundsError(input.fromWallet);
-      }
+      if (!debited) throw new InsufficientFundsError(input.fromWallet);
       await this.wallets.applyDelta(client, input.toWallet, input.amount);
 
-      const journal = {
-        id: randomUUID(),
+      const transactionId = await this.writeTransfer(client, {
         from: input.fromWallet,
         to: input.toWallet,
         amount: input.amount,
-      };
-      await this.writeJournal(client, journal);
-      return journal.id;
+      });
+      await this.idempotency.recordResult(client, key, transactionId);
+      return { transactionId, replayed: false as const };
     });
-    return { transactionId, attempts: 1 };
+    return { ...outcome, attempts: 1 };
   }
 
   /**
-   * Single-sided deposit (external funding). Used for seeding and the
-   * lost-update test. Documented limitation: not double-entry.
+   * Single-sided deposit (external funding). Used for seeding and the lost-update
+   * test. KNOWN LIMITATION: not double-entry.
    */
-  async deposit(input: { walletId: string; amount: number }): Promise<TransferResult> {
+  async deposit(input: DepositInput): Promise<TransferResult> {
     assertValidAmount(input.amount);
+    const key = input.idempotencyKey ?? randomUUID();
+    const requestHash = hashRequest({
+      op: 'deposit',
+      walletId: input.walletId,
+      amount: input.amount,
+    });
+
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        const transactionId = await this.db.withTransaction(async (client) => {
+        const outcome = await this.db.withTransaction(async (client) => {
+          const replay = await this.checkIdempotency(client, key, requestHash);
+          if (replay) return replay;
+
           const wallet = await this.wallets.findById(client, input.walletId);
           if (!wallet) throw new WalletNotFoundError(input.walletId);
           const applied = await this.wallets.applyDeltaOptimistic(
@@ -166,23 +207,29 @@ export class TransactionsService {
           );
           if (!applied) throw new OptimisticConflictError(wallet.id);
 
-          const txId = randomUUID();
+          const transactionId = randomUUID();
           await this.ledger.insertEntry(client, {
-            transactionId: txId,
+            transactionId,
             walletId: wallet.id,
             amount: input.amount,
             type: 'CREDIT',
           });
           await this.transactions.insert(client, {
-            id: txId,
+            id: transactionId,
             fromWallet: null,
             toWallet: wallet.id,
             amount: input.amount,
             status: 'DEPOSIT',
           });
-          return txId;
+          await this.outbox.insert(client, {
+            aggregateId: transactionId,
+            eventType: 'deposit.completed',
+            payload: { transactionId, walletId: wallet.id, amount: input.amount },
+          });
+          await this.idempotency.recordResult(client, key, transactionId);
+          return { transactionId, replayed: false as const };
         });
-        return { transactionId, attempts: attempt };
+        return { ...outcome, attempts: attempt };
       } catch (err) {
         const retryable =
           err instanceof OptimisticConflictError || isRetryablePgError(err);
@@ -196,30 +243,68 @@ export class TransactionsService {
     throw new OptimisticConflictError(input.walletId);
   }
 
-  /** Writes the two ledger rows + the transaction record for a transfer. */
-  private async writeJournal(
-    client: Parameters<Parameters<DatabaseService['withTransaction']>[0]>[0],
-    journal: { id: string; from: string; to: string; amount: number },
-  ): Promise<void> {
+  /**
+   * Idempotency gate, run first inside every write transaction. Returns a replay
+   * result if the key was already committed, or null if this caller owns the op.
+   * Rolls back with the rest of the transaction on failure, so a failed attempt
+   * never burns the key (option A: successes only).
+   */
+  private async checkIdempotency(
+    client: PoolClient,
+    key: string,
+    requestHash: string,
+  ): Promise<TransferResult | null> {
+    const claim = await this.idempotency.claim(client, key, requestHash);
+    if (claim.claimed) return null;
+
+    const existing = claim.existing!;
+    if (existing.request_hash !== requestHash) {
+      throw new IdempotencyConflictError(key);
+    }
+    if (!existing.transaction_id) {
+      // Committed row with no result should be impossible (insert + result live
+      // in one tx). Treat defensively as a transient conflict worth retrying.
+      throw new OptimisticConflictError(key);
+    }
+    return { transactionId: existing.transaction_id, attempts: 0, replayed: true };
+  }
+
+  /** Writes both ledger rows, the transaction record, and the outbox event. */
+  private async writeTransfer(
+    client: PoolClient,
+    t: { from: string; to: string; amount: number },
+  ): Promise<string> {
+    const transactionId = randomUUID();
     await this.ledger.insertEntry(client, {
-      transactionId: journal.id,
-      walletId: journal.from,
-      amount: journal.amount,
+      transactionId,
+      walletId: t.from,
+      amount: t.amount,
       type: 'DEBIT',
     });
     await this.ledger.insertEntry(client, {
-      transactionId: journal.id,
-      walletId: journal.to,
-      amount: journal.amount,
+      transactionId,
+      walletId: t.to,
+      amount: t.amount,
       type: 'CREDIT',
     });
     await this.transactions.insert(client, {
-      id: journal.id,
-      fromWallet: journal.from,
-      toWallet: journal.to,
-      amount: journal.amount,
+      id: transactionId,
+      fromWallet: t.from,
+      toWallet: t.to,
+      amount: t.amount,
       status: 'COMPLETED',
     });
+    await this.outbox.insert(client, {
+      aggregateId: transactionId,
+      eventType: 'transfer.completed',
+      payload: {
+        transactionId,
+        fromWallet: t.from,
+        toWallet: t.to,
+        amount: t.amount,
+      },
+    });
+    return transactionId;
   }
 }
 

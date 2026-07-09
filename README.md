@@ -2,7 +2,26 @@
 
 A portfolio project demonstrating distributed transaction handling. Built incrementally.
 
-## Phase 1 — single-service wallet + ledger correctness (current)
+## Phase 2 — idempotency keys + transactional outbox (current)
+
+Makes writes safe to retry, on the same single service.
+
+- **Idempotency**: client-supplied UUID per write, deduped inside the *same* transaction
+  as the write via `INSERT ... ON CONFLICT DO NOTHING` on a dedicated `idempotency_keys`
+  table. A replay returns the cached `transactionId`; concurrent duplicates block on the
+  first and return the same result; a key reused with different params is a `422`. Failures
+  roll the key back (option A) so they are never cached — a retry re-attempts.
+- **Transactional outbox**: the event-to-publish is written as an `outbox_events` row in the
+  same transaction as the ledger write (solves the dual-write problem). A separate **relay**
+  polls with `SELECT ... FOR UPDATE SKIP LOCKED`, publishes to the broker, and flips
+  `published`. Delivery is **at-least-once**, so consumers dedupe on `event.id`.
+- **Broker** is an in-memory `EventBus` stub for now; swapped for RabbitMQ in Phase 3+.
+
+Tests: `idempotency.spec.ts` (replay, concurrent duplicates, param-reuse `422`, key-not-burned-on-failure)
+and `outbox.spec.ts` (event only on commit, no event on rollback, no double-delivery, at-least-once
+crash recovery with an idempotent consumer).
+
+## Phase 1 — single-service wallet + ledger correctness
 
 Proves double-entry bookkeeping and concurrency control work under load, before any
 distribution is introduced.
@@ -46,9 +65,10 @@ npm start                    # optional: HTTP API on :3000
 
 These are intentional and addressed in later phases — worth naming in an interview:
 
-1. **No idempotency yet.** A retried HTTP request double-spends. → Phase 2 (idempotency keys +
-   unique constraint).
-2. **No outbox / events.** Writes are purely local. → Phase 2.
+1. **In-memory event bus, not RabbitMQ.** Outbox rows survive a crash, but the bus itself is
+   process-local. → Phase 3+ swaps in RabbitMQ.
+2. **Relay rolls back the whole batch on a publish error** (at-least-once, but no per-event
+   isolation). → Phase 4 adds per-event retry + dead-letter queue.
 3. **Single database and schema.** No real service isolation. → Phase 3 splits Wallet / Ledger /
    Orchestrator with the TCC flow.
 4. **Single-sided funding.** Deposits and opening balances create money from "equity" with no
@@ -61,8 +81,8 @@ These are intentional and addressed in later phases — worth naming in an inter
 
 ## Build order
 
-- Phase 1 — wallet + ledger correctness under concurrency ✅ (this)
-- Phase 2 — idempotency keys + outbox pattern
+- Phase 1 — wallet + ledger correctness under concurrency ✅
+- Phase 2 — idempotency keys + outbox pattern ✅ (this)
 - Phase 3 — split services + Transaction Orchestrator + TCC (Try/Confirm/Cancel)
 - Phase 4 — timeouts, auto-cancel, exponential backoff, dead-letter queue
 - Phase 5 — reconciliation job + chaos test (kill orchestrator mid-transaction)

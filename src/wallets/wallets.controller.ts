@@ -1,4 +1,12 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Param,
+  Post,
+} from '@nestjs/common';
 import { WalletsService } from './wallets.service';
 import { TransactionsService } from '../transactions/transactions.service';
 
@@ -22,7 +30,18 @@ export class WalletsController {
   }
 
   @Post(':id/deposit')
-  deposit(@Param('id') id: string, @Body() body: { amount: number }) {
-    return this.transactions.deposit({ walletId: id, amount: body.amount });
+  deposit(
+    @Param('id') id: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() body: { amount: number },
+  ) {
+    if (!idempotencyKey) {
+      throw new BadRequestException('Idempotency-Key header is required');
+    }
+    return this.transactions.deposit({
+      walletId: id,
+      amount: body.amount,
+      idempotencyKey,
+    });
   }
 }

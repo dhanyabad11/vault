@@ -1,4 +1,4 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Headers, Post } from '@nestjs/common';
 import { LockStrategy, TransactionsService } from './transactions.service';
 
 @Controller('transfers')
@@ -7,6 +7,7 @@ export class TransactionsController {
 
   @Post()
   transfer(
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
     @Body()
     body: {
       fromWallet: string;
@@ -15,6 +16,9 @@ export class TransactionsController {
       strategy?: LockStrategy;
     },
   ) {
-    return this.transactions.transfer(body);
+    if (!idempotencyKey) {
+      throw new BadRequestException('Idempotency-Key header is required');
+    }
+    return this.transactions.transfer({ ...body, idempotencyKey });
   }
 }
